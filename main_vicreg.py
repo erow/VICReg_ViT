@@ -164,6 +164,7 @@ def main(args):
                 model=model.state_dict(),
                 optimizer=optimizer.state_dict(),
             )
+            torch.save(state, args.exp_dir / f"model.pth")
             torch.save(state, args.exp_dir / f"checkpoint_{epoch+1}.pth")
     if args.rank == 0:
         torch.save(model.module.backbone.state_dict(), args.exp_dir / "weights.pth")
