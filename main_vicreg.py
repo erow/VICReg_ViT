@@ -39,7 +39,7 @@ def get_arguments():
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
 
     # Model
-    parser.add_argument("--arch", type=str, default="resnet50",
+    parser.add_argument("--arch", type=str, default="vit_base",
                         help='Architecture of the backbone encoder network')
     parser.add_argument("--mlp", default="8192-8192-8192",
                         help='Size and number of layers of the MLP expander head')
@@ -105,7 +105,7 @@ def main(args):
 
     model = VICReg(args).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu],static_graph=True)
     optimizer = LARS(
         model.parameters(),
         lr=0,
@@ -123,6 +123,10 @@ def main(args):
         optimizer.load_state_dict(ckpt["optimizer"])
     else:
         start_epoch = 0
+    
+    import wandb
+    if args.rank == 0:
+        wandb.init(name="vicreg", project="ssl", config=args)
 
     start_time = last_logging = time.time()
     scaler = torch.cuda.amp.GradScaler()
@@ -136,7 +140,7 @@ def main(args):
 
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
-                loss = model.forward(x, y)
+                loss, log = model(x, y)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -148,10 +152,11 @@ def main(args):
                     step=step,
                     loss=loss.item(),
                     time=int(current_time - start_time),
-                    lr=lr,
+                    lr=lr, **log
                 )
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
+                if wandb.run: wandb.log(stats)
                 last_logging = current_time
         if args.rank == 0:
             state = dict(
@@ -159,9 +164,13 @@ def main(args):
                 model=model.state_dict(),
                 optimizer=optimizer.state_dict(),
             )
-            torch.save(state, args.exp_dir / "model.pth")
+            torch.save(state, args.exp_dir / f"checkpoint_{epoch+1}.pth")
     if args.rank == 0:
-        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+        torch.save(model.module.backbone.state_dict(), args.exp_dir / "weights.pth")
+        if wandb.run: 
+            artifact = wandb.Artifact("VICReg", type="model", )
+            artifact.add_file(args.exp_dir / "weights.pth")
+            wandb.log_artifact(artifact)
 
 
 def adjust_learning_rate(args, optimizer, loader, step):
@@ -180,15 +189,17 @@ def adjust_learning_rate(args, optimizer, loader, step):
         param_group["lr"] = lr
     return lr
 
-
+from timm.models.vision_transformer import vit_base_patch16_224
+from torch.utils.checkpoint import checkpoint    
 class VICReg(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
         self.num_features = int(args.mlp.split("-")[-1])
-        self.backbone, self.embedding = resnet.__dict__[args.arch](
-            zero_init_residual=True
-        )
+        self.backbone, self.embedding = vit_base_patch16_224(num_classes=512), 512
+        self.backbone.set_grad_checkpointing(True)
+        
+        
         self.projector = Projector(args, self.embedding)
 
     def forward(self, x, y):
@@ -217,7 +228,8 @@ class VICReg(nn.Module):
             + self.args.std_coeff * std_loss
             + self.args.cov_coeff * cov_loss
         )
-        return loss
+        log = dict(repr_loss=repr_loss.item(), std_loss=std_loss.item(), cov_loss=cov_loss.item())
+        return loss, log
 
 
 def Projector(args, embedding):
